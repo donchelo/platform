@@ -1,0 +1,203 @@
+/**
+ * Logger central del ecosistema superAI.
+ *
+ * Une lo mejor de los loggers que ya existían:
+ *   - orderloader/lib/logger.ts  → niveles, JSON|text, child(), contexto por corrida.
+ *   - sap-b1-backend/lib/logger.ts → redacción de secretos y requestId.
+ *
+ * Añade:
+ *   - Contexto por request vía AsyncLocalStorage (requestId/tenant/userId/service se
+ *     inyectan automáticamente en cada log sin pasarlos a mano por las capas).
+ *   - Transporte async, en lote y "fire-and-forget" hacia el ingest API del panel
+ *     admin. NUNCA bloquea el request; si el envío falla, cae a stderr (la app no
+ *     se rompe por logging). Por defecto persiste TODOS los niveles.
+ */
+import { AsyncLocalStorage } from "node:async_hooks"
+import { randomUUID } from "node:crypto"
+
+export type Level = "DEBUG" | "INFO" | "WARN" | "ERROR"
+
+const LEVEL_VALUES: Record<Level, number> = { DEBUG: 10, INFO: 20, WARN: 30, ERROR: 40 }
+
+// Se leen dinámicamente del entorno para ser configurables (y testeables) sin
+// reimportar el módulo.
+function minLevel(): number {
+  return LEVEL_VALUES[(process.env.LOG_LEVEL?.toUpperCase() as Level) ?? "INFO"] ?? 20
+}
+function jsonFormat(): boolean {
+  return process.env.LOG_FORMAT === "json"
+}
+
+export interface RunContext {
+  requestId?: string
+  tenant?: string
+  userId?: string
+  service?: string
+  [key: string]: unknown
+}
+
+const als = new AsyncLocalStorage<RunContext>()
+
+/** Corre `fn` con un contexto que todo log dentro hereda automáticamente. */
+export function runWithContext<T>(ctx: RunContext, fn: () => T): T {
+  return als.run({ ...ctx }, fn)
+}
+
+/** Agrega/actualiza campos del contexto activo (no-op si no hay contexto). */
+export function setContextFields(fields: RunContext): void {
+  const ctx = als.getStore()
+  if (ctx) Object.assign(ctx, fields)
+}
+
+export function getContext(): RunContext {
+  return als.getStore() ?? {}
+}
+
+/** Service por defecto para todos los logs de esta app (p.ej. "kpis"). */
+let SERVICE_NAME = process.env.PLATFORM_SERVICE ?? process.env.SERVICE_ID ?? "unknown"
+export function setServiceName(name: string): void {
+  SERVICE_NAME = name
+}
+
+/* ── Redacción de secretos (red de seguridad de sap-b1-backend) ──────────── */
+
+const SENSITIVE_KEY = /pass(word)?|secret|token|api[-_]?key|authorization|cookie|credential/i
+
+function sanitize(fields: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  for (const [k, v] of Object.entries(fields)) {
+    out[k] = SENSITIVE_KEY.test(k) ? "[REDACTED]" : v
+  }
+  return out
+}
+
+function serializeErr(err: unknown): { name?: string; message: string; stack?: string } {
+  if (err instanceof Error) return { name: err.name, message: err.message, stack: err.stack }
+  return { message: String(err) }
+}
+
+/* ── Transporte async hacia el ingest API ────────────────────────────────── */
+
+export interface TransportConfig {
+  /** URL del ingest API del panel admin, p.ej. https://admin.ai4u.com/api/ingest/logs */
+  endpoint: string
+  /** Secreto compartido para autenticar el ingest (header x-ingest-secret). */
+  secret: string
+  /** ms entre flushes (default 2000). */
+  flushMs?: number
+  /** máximo de registros por lote (default 50). */
+  batchMax?: number
+}
+
+let transport: TransportConfig | null = null
+let buffer: Record<string, unknown>[] = []
+let timer: ReturnType<typeof setInterval> | null = null
+
+/** Activa el envío a Supabase vía el ingest API. Llamar una vez al arrancar la app. */
+export function configureTransport(cfg: TransportConfig): void {
+  transport = cfg
+  if (timer) clearInterval(timer)
+  timer = setInterval(() => void flush(), cfg.flushMs ?? 2000)
+  // No mantener vivo el proceso solo por el logger.
+  timer.unref?.()
+}
+
+async function flush(): Promise<void> {
+  if (!transport || buffer.length === 0) return
+  const batch = buffer
+  buffer = []
+  try {
+    await fetch(transport.endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-ingest-secret": transport.secret },
+      body: JSON.stringify({ logs: batch }),
+      keepalive: true,
+    })
+  } catch (err) {
+    // El ingest cayó: no perder del todo el dato ni romper la app.
+    process.stderr.write(`[platform/logger] ingest flush failed: ${String(err)}\n`)
+  }
+}
+
+/** Fuerza el envío inmediato del buffer (útil en cron/scripts antes de salir). */
+export function flushLogs(): Promise<void> {
+  return flush()
+}
+
+function enqueue(record: Record<string, unknown>): void {
+  if (!transport) return
+  buffer.push(record)
+  if (buffer.length >= (transport.batchMax ?? 50)) void flush()
+}
+
+/* ── Logger ──────────────────────────────────────────────────────────────── */
+
+type LogMethod = {
+  (msg: string): void
+  (fields: Record<string, unknown>, msg: string): void
+}
+
+function emit(level: Level, component: string, fieldsOrMsg: Record<string, unknown> | string, msg?: string): void {
+  // ERROR siempre se emite y persiste, aunque MIN_LEVEL sea más alto (nada de
+  // fallos silenciosos). El resto respeta el umbral.
+  if (level !== "ERROR" && LEVEL_VALUES[level] < minLevel()) return
+
+  let message: string
+  let extra: Record<string, unknown> = {}
+  if (typeof fieldsOrMsg === "string") {
+    message = fieldsOrMsg
+  } else {
+    message = msg ?? ""
+    extra = { ...fieldsOrMsg }
+  }
+
+  const ctx = getContext()
+  const errField = extra.err
+  if (errField) delete extra.err
+
+  const record: Record<string, unknown> = {
+    ts: new Date().toISOString(),
+    level,
+    service: SERVICE_NAME,
+    component,
+    ...ctx,
+    ...sanitize(extra),
+    msg: message,
+  }
+  if (errField !== undefined) record.err = serializeErr(errField)
+
+  // 1) stdout/stderr — siempre (mantiene los logs de Vercel/Docker intactos).
+  const stream = level === "ERROR" ? process.stderr : process.stdout
+  if (jsonFormat()) {
+    stream.write(JSON.stringify(record) + "\n")
+  } else {
+    const time = (record.ts as string).slice(0, 23).replace("T", " ")
+    const rid = ctx.requestId ? ` rid=${ctx.requestId}` : ""
+    stream.write(`${time} ${level.padEnd(5)} [${component}]${rid} ${message}\n`)
+  }
+
+  // 2) Supabase (vía ingest) — async, en lote, fire-and-forget.
+  enqueue(record)
+}
+
+export class Logger {
+  constructor(private readonly component: string) {}
+
+  debug: LogMethod = (a: Record<string, unknown> | string, b?: string) => emit("DEBUG", this.component, a, b)
+  info: LogMethod = (a: Record<string, unknown> | string, b?: string) => emit("INFO", this.component, a, b)
+  warn: LogMethod = (a: Record<string, unknown> | string, b?: string) => emit("WARN", this.component, a, b)
+  error: LogMethod = (a: Record<string, unknown> | string, b?: string) => emit("ERROR", this.component, a, b)
+
+  child(bindings: { component?: string }): Logger {
+    return new Logger(bindings.component ?? this.component)
+  }
+}
+
+export function getLogger(component: string): Logger {
+  return new Logger(component)
+}
+
+/** Genera un request id corto (compatible con sap-b1-backend.newRequestId). */
+export function newRequestId(): string {
+  return randomUUID().slice(0, 8)
+}
