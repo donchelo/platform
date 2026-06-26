@@ -11,8 +11,30 @@
  * Tipa contra Request/Response estándar de la Web (los route handlers de Next los
  * soportan), por lo que el paquete NO depende de `next`.
  */
-import { getLogger, newRequestId, runWithContext, setContextFields, Logger } from "../logger"
+import { getLogger, newRequestId, runWithContext, setContextFields, flushLogs, Logger } from "../logger"
 import { toErrorResponse, classifyUnknownError } from "../errors"
+
+/**
+ * Garantiza el envío de logs en serverless SIN acoplar latencia: usa `after()` de
+ * Next (corre tras enviar la respuesta, manteniendo la función viva hasta vaciar el
+ * buffer). Si no hay runtime Next, hace un flush best-effort no bloqueante.
+ */
+async function scheduleFlush(): Promise<void> {
+  try {
+    // Specifier no-literal a propósito: evita que tsc intente resolver "next/server"
+    // (platform no depende de next; el módulo existe en la app consumidora).
+    const moduleName = "next/server"
+    const mod = (await import(moduleName)) as Record<string, unknown>
+    const after = (mod.after ?? mod.unstable_after) as ((fn: () => unknown) => void) | undefined
+    if (after) {
+      after(() => flushLogs())
+      return
+    }
+  } catch {
+    // no estamos en runtime Next
+  }
+  void flushLogs()
+}
 import {
   readIdentity,
   requireModule,
@@ -65,55 +87,62 @@ export function withApiHandler<R extends object = object>(
 
     return runWithContext({ requestId }, async () => {
       const start = Date.now()
-      try {
-        // ── Auth (opcional) ──
-        let identity: Identity | null = null
+      const buildResponse = async (): Promise<Response> => {
+        try {
+          // ── Auth (opcional) ──
+          let identity: Identity | null = null
 
-        if (options.requireService) {
-          const result = verifyServiceRequest(req, options.serviceAuth)
-          if (!result.ok) {
-            log.warn({ status: 401 }, `${label}: auth de servicio inválida`)
-            return jsonResponse(
-              { error: "No autenticado", code: "UNAUTHORIZED", category: "validation", requestId },
-              401,
-              requestId,
-            )
+          if (options.requireService) {
+            const result = verifyServiceRequest(req, options.serviceAuth)
+            if (!result.ok) {
+              log.warn({ status: 401 }, `${label}: auth de servicio inválida`)
+              return jsonResponse(
+                { error: "No autenticado", code: "UNAUTHORIZED", category: "validation", requestId },
+                401,
+                requestId,
+              )
+            }
+            if (result.tenantId) setContextFields({ tenant: result.tenantId })
           }
-          if (result.tenantId) setContextFields({ tenant: result.tenantId })
-        }
 
-        if (options.requireModule || options.requireRole) {
-          identity = readIdentity(req, options.sessionAuth)
-          if (identity) setContextFields({ tenant: identity.tenantId, userId: identity.userId })
-          if (options.requireModule) requireModule(identity, options.requireModule)
-          if (options.requireRole) requireRole(identity, options.requireRole)
-        } else {
-          // Lee identidad si está disponible, pero no la exige.
-          identity = readIdentity(req, options.sessionAuth)
-          if (identity) setContextFields({ tenant: identity.tenantId, userId: identity.userId })
-        }
+          if (options.requireModule || options.requireRole) {
+            identity = readIdentity(req, options.sessionAuth)
+            if (identity) setContextFields({ tenant: identity.tenantId, userId: identity.userId })
+            if (options.requireModule) requireModule(identity, options.requireModule)
+            if (options.requireRole) requireRole(identity, options.requireRole)
+          } else {
+            // Lee identidad si está disponible, pero no la exige.
+            identity = readIdentity(req, options.sessionAuth)
+            if (identity) setContextFields({ tenant: identity.tenantId, userId: identity.userId })
+          }
 
-        // ── Handler ──
-        const ctx = { requestId, log, identity, ...(routeCtx ?? ({} as R)) } as ApiContext & R
-        const result = await handler(req, ctx)
+          // ── Handler ──
+          const ctx = { requestId, log, identity, ...(routeCtx ?? ({} as R)) } as ApiContext & R
+          const result = await handler(req, ctx)
 
-        const durationMs = Date.now() - start
-        if (result instanceof Response) {
-          log.info({ durationMs, status: result.status }, label)
-          // Propaga el requestId aunque el handler haya construido su propia Response.
-          if (!result.headers.get("x-request-id")) result.headers.set("x-request-id", requestId)
-          return result
+          const durationMs = Date.now() - start
+          if (result instanceof Response) {
+            log.info({ durationMs, status: result.status }, label)
+            // Propaga el requestId aunque el handler haya construido su propia Response.
+            if (!result.headers.get("x-request-id")) result.headers.set("x-request-id", requestId)
+            return result
+          }
+          log.info({ durationMs, status: 200 }, label)
+          return jsonResponse(result, 200, requestId)
+        } catch (err) {
+          const durationMs = Date.now() - start
+          const appErr = classifyUnknownError(err)
+          // Log con detalle completo (stack incluido); la respuesta al cliente es segura.
+          log.error({ durationMs, status: appErr.httpStatus, code: appErr.code, err: appErr.cause ?? appErr }, `${label} error`)
+          const { status, body } = toErrorResponse(appErr, requestId)
+          return jsonResponse(body, status, requestId)
         }
-        log.info({ durationMs, status: 200 }, label)
-        return jsonResponse(result, 200, requestId)
-      } catch (err) {
-        const durationMs = Date.now() - start
-        const appErr = classifyUnknownError(err)
-        // Log con detalle completo (stack incluido); la respuesta al cliente es segura.
-        log.error({ durationMs, status: appErr.httpStatus, code: appErr.code, err: appErr.cause ?? appErr }, `${label} error`)
-        const { status, body } = toErrorResponse(appErr, requestId)
-        return jsonResponse(body, status, requestId)
       }
+
+      const response = await buildResponse()
+      // Asegura el envío de logs tras responder (serverless-safe, sin bloquear latencia).
+      await scheduleFlush()
+      return response
     })
   }
 }
