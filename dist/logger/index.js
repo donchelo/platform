@@ -70,6 +70,28 @@ function serializeErr(err) {
 let transport = null;
 let buffer = [];
 let timer = null;
+/**
+ * Bundlers como Turbopack pueden instanciar este módulo más de una vez dentro
+ * del mismo proceso (una copia por bundle de función serverless: una para
+ * instrumentation.ts, otra para cada route handler que importe `./http`).
+ * configureTransport() solo setea la variable `transport` de SU PROPIA copia
+ * del módulo — si otra copia es la que realmente encola/envía logs, esa nunca
+ * se entera y el flush queda silenciosamente vacío para siempre. Confirmado en
+ * vivo (jul-2026): el log de arranque mostraba "transporte configurado" pero
+ * platform_logs seguía en 0 filas.
+ *
+ * Por eso NO confiamos solo en el estado en memoria: si `configureTransport`
+ * no corrió en ESTA copia del módulo, resolvemos el transporte leyendo
+ * `process.env` directamente (que sí es un singleton real de Node, ajeno al
+ * bundler) antes de descartar el log.
+ */
+function resolveTransport() {
+    if (transport)
+        return transport;
+    const endpoint = process.env.PLATFORM_INGEST_URL;
+    const secret = process.env.INGEST_SECRET;
+    return endpoint && secret ? { endpoint, secret } : null;
+}
 /** Activa el envío a Supabase vía el ingest API. Llamar una vez al arrancar la app. */
 function configureTransport(cfg) {
     transport = cfg;
@@ -80,17 +102,24 @@ function configureTransport(cfg) {
     timer.unref?.();
 }
 async function flush() {
-    if (!transport || buffer.length === 0)
+    const cfg = resolveTransport();
+    if (!cfg || buffer.length === 0)
         return;
     const batch = buffer;
     buffer = [];
     try {
-        await fetch(transport.endpoint, {
+        const res = await fetch(cfg.endpoint, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-ingest-secret": transport.secret },
+            headers: { "content-type": "application/json", "x-ingest-secret": cfg.secret },
             body: JSON.stringify({ logs: batch }),
             keepalive: true,
         });
+        // fetch() NO lanza por status HTTP no-2xx (p.ej. una redirección de Vercel
+        // Deployment Protection hacia su login) — hay que chequearlo explícitamente
+        // o el fallo pasa inadvertido igual que el bug de arriba.
+        if (!res.ok) {
+            process.stderr.write(`[platform/logger] ingest flush respondió ${res.status}: ${cfg.endpoint}\n`);
+        }
     }
     catch (err) {
         // El ingest cayó: no perder del todo el dato ni romper la app.
@@ -102,10 +131,11 @@ function flushLogs() {
     return flush();
 }
 function enqueue(record) {
-    if (!transport)
+    const cfg = resolveTransport();
+    if (!cfg)
         return;
     buffer.push(record);
-    if (buffer.length >= (transport.batchMax ?? 50))
+    if (buffer.length >= (cfg.batchMax ?? 50))
         void flush();
 }
 function emit(level, component, fieldsOrMsg, msg) {
