@@ -1,8 +1,17 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, vi } from "vitest"
 import { withApiHandler } from "../src/http"
 import { ValidationError } from "../src/errors"
+import * as logger from "../src/logger"
 
 describe("withApiHandler", () => {
+  it("dispara el flush de logs tras responder (regresión: scheduleFlush no debe tragarse el error del import dinámico roto)", async () => {
+    const flushSpy = vi.spyOn(logger, "flushLogs").mockResolvedValue()
+    const route = withApiHandler(async () => ({ ok: true }))
+    await route(new Request("https://x/api/test"))
+    expect(flushSpy).toHaveBeenCalledTimes(1)
+    flushSpy.mockRestore()
+  })
+
   it("envuelve un resultado en JSON 200 con x-request-id", async () => {
     const route = withApiHandler(async () => ({ hello: "world" }))
     const res = await route(new Request("https://x/api/test"))

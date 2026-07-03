@@ -1,6 +1,6 @@
 {
   "name": "@ai4u/platform",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Preocupaciones transversales para el ecosistema superAI: logging, errores tipados y auth (identidad + permisos)",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -36,7 +36,8 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai4u/mc-sso": "github:donchelo/mc-sso"
+    "@ai4u/mc-sso": "github:donchelo/mc-sso",
+    "@vercel/functions": "^1.6.0"
   },
   "devDependencies": {
     "@types/node": "^20",

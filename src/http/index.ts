@@ -9,31 +9,40 @@
  *     un JSON uniforme { error, code, category, requestId }. Nada de fallos silenciosos.
  *
  * Tipa contra Request/Response estándar de la Web (los route handlers de Next los
- * soportan), por lo que el paquete NO depende de `next`.
+ * soportan), por lo que el paquete no depende de `next`. Sí depende de
+ * `@vercel/functions` para el flush de logs sin bloquear la respuesta (agnóstico
+ * de framework, pero requiere correr sobre una función de Vercel).
  */
 import { getLogger, newRequestId, runWithContext, setContextFields, flushLogs, Logger } from "../logger"
 import { toErrorResponse, classifyUnknownError } from "../errors"
+import { waitUntil } from "@vercel/functions"
 
 /**
- * Garantiza el envío de logs en serverless SIN acoplar latencia: usa `after()` de
- * Next (corre tras enviar la respuesta, manteniendo la función viva hasta vaciar el
- * buffer). Si no hay runtime Next, hace un flush best-effort no bloqueante.
+ * Garantiza el envío de logs en serverless SIN acoplar latencia: usa `waitUntil()`
+ * de @vercel/functions, que extiende la vida de la función hasta que la promesa
+ * resuelva sin bloquear la respuesta al cliente.
+ *
+ * BUG histórico (jul-2026): la versión anterior intentaba `import("next/server")`
+ * con un specifier NO literal (una variable) para evitar que `platform` dependiera
+ * de Next.js en tiempo de build. Pero Turbopack/webpack no pueden analizar
+ * estáticamente un import con nombre dinámico: en vez de dejarlo resolver en
+ * runtime, lo REEMPLAZAN por un throw sintético ("Cannot find module as
+ * expression is too dynamic") que dispara SIEMPRE. El catch (vacío) lo absorbía
+ * silenciosamente y caía a `void flushLogs()` sin esperar — en serverless, la
+ * función se congela apenas responde, así que el fetch de ingesta nunca llegaba
+ * a completarse ni a fallar visiblemente. Resultado: platform_logs se quedaba
+ * vacía en TODAS las apps del ecosistema aunque el logger corriera bien.
+ * `waitUntil` es un import ESTÁTICO (analizable por cualquier bundler) y
+ * agnóstico de framework — funciona igual en Next.js, Express, etc. sobre Vercel.
  */
 async function scheduleFlush(): Promise<void> {
   try {
-    // Specifier no-literal a propósito: evita que tsc intente resolver "next/server"
-    // (platform no depende de next; el módulo existe en la app consumidora).
-    const moduleName = "next/server"
-    const mod = (await import(moduleName)) as Record<string, unknown>
-    const after = (mod.after ?? mod.unstable_after) as ((fn: () => unknown) => void) | undefined
-    if (after) {
-      after(() => flushLogs())
-      return
-    }
+    waitUntil(flushLogs())
   } catch {
-    // no estamos en runtime Next
+    // No estamos en una función Vercel activa (p.ej. tests, scripts locales):
+    // flush best-effort sin bloquear.
+    void flushLogs()
   }
-  void flushLogs()
 }
 import {
   readIdentity,
