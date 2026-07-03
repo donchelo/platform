@@ -12,40 +12,44 @@ exports.withApiHandler = withApiHandler;
  *     un JSON uniforme { error, code, category, requestId }. Nada de fallos silenciosos.
  *
  * Tipa contra Request/Response estándar de la Web (los route handlers de Next los
- * soportan), por lo que el paquete no depende de `next`. Sí depende de
- * `@vercel/functions` para el flush de logs sin bloquear la respuesta (agnóstico
- * de framework, pero requiere correr sobre una función de Vercel).
+ * soportan), por lo que el paquete no depende de `next` ni de `@vercel/*` —
+ * el flush de logs se espera de forma bloqueante antes de responder (ver
+ * scheduleFlush más abajo), agnóstico de runtime.
  */
 const logger_1 = require("../logger");
 const errors_1 = require("../errors");
-const functions_1 = require("@vercel/functions");
 /**
- * Garantiza el envío de logs en serverless SIN acoplar latencia: usa `waitUntil()`
- * de @vercel/functions, que extiende la vida de la función hasta que la promesa
- * resuelva sin bloquear la respuesta al cliente.
+ * Garantiza el envío de logs ANTES de responder: `await flushLogs()` directo.
+ * Agrega la latencia del POST al ingest (normalmente 50-150ms) a la respuesta,
+ * pero es 100% confiable — no depende de configuración de infraestructura que
+ * este paquete no controla ni puede verificar.
  *
- * BUG histórico (jul-2026): la versión anterior intentaba `import("next/server")`
- * con un specifier NO literal (una variable) para evitar que `platform` dependiera
- * de Next.js en tiempo de build. Pero Turbopack/webpack no pueden analizar
- * estáticamente un import con nombre dinámico: en vez de dejarlo resolver en
- * runtime, lo REEMPLAZAN por un throw sintético ("Cannot find module as
- * expression is too dynamic") que dispara SIEMPRE. El catch (vacío) lo absorbía
- * silenciosamente y caía a `void flushLogs()` sin esperar — en serverless, la
- * función se congela apenas responde, así que el fetch de ingesta nunca llegaba
- * a completarse ni a fallar visiblemente. Resultado: platform_logs se quedaba
- * vacía en TODAS las apps del ecosistema aunque el logger corriera bien.
- * `waitUntil` es un import ESTÁTICO (analizable por cualquier bundler) y
- * agnóstico de framework — funciona igual en Next.js, Express, etc. sobre Vercel.
+ * BUG histórico #1 (jul-2026, v0.2.0): `import("next/server")` con specifier NO
+ * literal (una variable) para evitar depender de Next.js en build. Turbopack/
+ * webpack no pueden analizar estáticamente un import con nombre dinámico: lo
+ * REEMPLAZAN por un throw sintético que dispara SIEMPRE en producción. El catch
+ * (vacío) lo absorbía y caía a `void flushLogs()` sin esperar — en serverless
+ * la función se congela apenas responde, el fetch de ingesta nunca llegaba a
+ * completarse. platform_logs quedaba vacía en TODAS las apps del ecosistema.
+ *
+ * BUG histórico #2 (jul-2026, v0.2.1): se cambió a `waitUntil()` de
+ * @vercel/functions (import estático, sin el problema de arriba). Pero
+ * `waitUntil()` resuelve el contexto vía `globalThis[Symbol.for("@vercel/
+ * request-context")]`, que Vercel solo inyecta con **Fluid Compute habilitado**
+ * — sin eso, `getContext().waitUntil` es `undefined` y la llamada no hace nada
+ * (fail silently por diseño del propio paquete de Vercel). No hay forma de
+ * verificar ni activar Fluid Compute desde este paquete (es config del proyecto
+ * en el dashboard de Vercel), así que no se puede depender de que esté activo
+ * en las ~25 apps consumidoras. Confirmado en vivo: 0 requests llegaron al
+ * ingest tras el fix de v0.2.1 en mission-control/sap-b1-backend.
+ *
+ * v0.2.2: vuelve a lo simple y verificable — await bloqueante. Si algún
+ * consumidor confirma Fluid Compute activo, puede envolver su propio
+ * withApiHandler con waitUntil() a nivel de su propio código; este paquete no
+ * lo asume.
  */
 async function scheduleFlush() {
-    try {
-        (0, functions_1.waitUntil)((0, logger_1.flushLogs)());
-    }
-    catch {
-        // No estamos en una función Vercel activa (p.ej. tests, scripts locales):
-        // flush best-effort sin bloquear.
-        void (0, logger_1.flushLogs)();
-    }
+    await (0, logger_1.flushLogs)();
 }
 const auth_1 = require("../auth");
 function jsonResponse(body, status, requestId) {

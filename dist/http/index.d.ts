@@ -9,9 +9,9 @@
  *     un JSON uniforme { error, code, category, requestId }. Nada de fallos silenciosos.
  *
  * Tipa contra Request/Response estándar de la Web (los route handlers de Next los
- * soportan), por lo que el paquete no depende de `next`. Sí depende de
- * `@vercel/functions` para el flush de logs sin bloquear la respuesta (agnóstico
- * de framework, pero requiere correr sobre una función de Vercel).
+ * soportan), por lo que el paquete no depende de `next` ni de `@vercel/*` —
+ * el flush de logs se espera de forma bloqueante antes de responder (ver
+ * scheduleFlush más abajo), agnóstico de runtime.
  */
 import { Logger } from "../logger";
 import { type Identity, type SessionAuthConfig, type ServiceAuthConfig } from "../auth";
