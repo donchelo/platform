@@ -52,6 +52,14 @@ function getContext() {
 let SERVICE_NAME = process.env.PLATFORM_SERVICE ?? process.env.SERVICE_ID ?? "unknown";
 function setServiceName(name) {
     SERVICE_NAME = name;
+    // Mismo problema que resolveTransport() (ver abajo): otra copia de este
+    // módulo (Turbopack puede instanciarlo más de una vez por proceso, una por
+    // bundle de función serverless) nunca ve esta asignación y sigue emitiendo
+    // "unknown". process.env sí es un singleton real de Node, ajeno al bundler.
+    process.env.PLATFORM_SERVICE = name;
+}
+function resolveServiceName() {
+    return process.env.PLATFORM_SERVICE ?? process.env.SERVICE_ID ?? SERVICE_NAME;
 }
 /* ── Redacción de secretos (red de seguridad de sap-b1-backend) ──────────── */
 const SENSITIVE_KEY = /pass(word)?|secret|token|api[-_]?key|authorization|cookie|credential/i;
@@ -159,7 +167,7 @@ function emit(level, component, fieldsOrMsg, msg) {
     const record = {
         ts: new Date().toISOString(),
         level,
-        service: SERVICE_NAME,
+        service: resolveServiceName(),
         component,
         ...ctx,
         ...sanitize(extra),
