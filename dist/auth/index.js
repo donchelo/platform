@@ -92,8 +92,9 @@ function requireRole(identity, role) {
 /** Valida auth de servicio (x-mc-secret o X-API-Key). Comparación de longitud constante simple. */
 function verifyServiceRequest(req, cfg = {}) {
     const sharedSecret = cfg.sharedSecret ?? process.env.MISSION_CONTROL_SECRET;
+    const candidates = [sharedSecret, ...(cfg.sharedSecrets ?? [])].filter((s) => typeof s === "string" && s.length > 0);
     const mcSecret = req.headers.get("x-mc-secret");
-    if (sharedSecret && mcSecret && safeEqual(mcSecret, sharedSecret))
+    if (mcSecret && candidates.some((candidate) => safeEqual(mcSecret, candidate)))
         return { ok: true };
     const apiKey = req.headers.get("x-api-key");
     if (apiKey && cfg.apiKeys) {
