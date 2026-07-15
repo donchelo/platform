@@ -30,6 +30,12 @@ export declare function requireRole(identity: Identity | null, role: string | st
 export interface ServiceAuthConfig {
     /** Secreto compartido aceptado en x-mc-secret (default process.env.MISSION_CONTROL_SECRET). */
     sharedSecret?: string;
+    /**
+     * Secretos adicionales aceptados en x-mc-secret, además de `sharedSecret`.
+     * Permite rotar sin downtime: durante la migración, el caller pasa el valor
+     * viejo Y el nuevo aquí, y ambos autentican hasta que se retire el viejo.
+     */
+    sharedSecrets?: string[];
     /** API keys válidas por tenant: { tamaprint: "key...", flexoimpresos: "key..." }. */
     apiKeys?: Record<string, string>;
 }

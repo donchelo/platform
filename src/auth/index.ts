@@ -112,6 +112,12 @@ export function requireRole(identity: Identity | null, role: string | string[]):
 export interface ServiceAuthConfig {
   /** Secreto compartido aceptado en x-mc-secret (default process.env.MISSION_CONTROL_SECRET). */
   sharedSecret?: string
+  /**
+   * Secretos adicionales aceptados en x-mc-secret, además de `sharedSecret`.
+   * Permite rotar sin downtime: durante la migración, el caller pasa el valor
+   * viejo Y el nuevo aquí, y ambos autentican hasta que se retire el viejo.
+   */
+  sharedSecrets?: string[]
   /** API keys válidas por tenant: { tamaprint: "key...", flexoimpresos: "key..." }. */
   apiKeys?: Record<string, string>
 }
@@ -125,8 +131,11 @@ export interface ServiceAuthResult {
 /** Valida auth de servicio (x-mc-secret o X-API-Key). Comparación de longitud constante simple. */
 export function verifyServiceRequest(req: HeaderCarrier, cfg: ServiceAuthConfig = {}): ServiceAuthResult {
   const sharedSecret = cfg.sharedSecret ?? process.env.MISSION_CONTROL_SECRET
+  const candidates = [sharedSecret, ...(cfg.sharedSecrets ?? [])].filter(
+    (s): s is string => typeof s === "string" && s.length > 0
+  )
   const mcSecret = req.headers.get("x-mc-secret")
-  if (sharedSecret && mcSecret && safeEqual(mcSecret, sharedSecret)) return { ok: true }
+  if (mcSecret && candidates.some((candidate) => safeEqual(mcSecret, candidate))) return { ok: true }
 
   const apiKey = req.headers.get("x-api-key")
   if (apiKey && cfg.apiKeys) {
