@@ -65,3 +65,27 @@ describe("logger central", () => {
     expect(out).toContain("explotó")
   })
 })
+
+describe("service name entre copias del módulo (regresión: bug de 'unknown')", () => {
+  afterEach(() => {
+    delete process.env.PLATFORM_SERVICE
+    vi.resetModules()
+  })
+
+  it("una copia FRESCA del módulo (que nunca corrió setServiceName) igual emite el service correcto vía process.env", async () => {
+    // Simula el escenario real: Turbopack instancia ./logger más de una vez por
+    // proceso (una por bundle de función serverless). instrumentation.ts corre
+    // setServiceName() en SU copia; una ruta de API importa una copia DISTINTA
+    // que jamás vio esa llamada. Antes del fix, esa copia emitía "unknown".
+    const first = await import("../src/logger")
+    first.setServiceName("mission-control")
+
+    vi.resetModules()
+    const second: typeof first = await import("../src/logger")
+
+    process.env.LOG_FORMAT = "json"
+    const lines = captureStdout(() => second.getLogger("tickets").info("hola"))
+    const record = JSON.parse(lines.join(""))
+    expect(record.service).toBe("mission-control")
+  })
+})
